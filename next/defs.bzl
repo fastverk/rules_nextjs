@@ -27,22 +27,42 @@ NextBuildInfo = provider(
 def _next_build_impl(ctx):
     out_dir = ctx.actions.declare_directory(ctx.label.name + ".out")
 
-    next_bin = ctx.attr.next_bin
-
     env = {
         "NEXT_TELEMETRY_DISABLED": "1",
         "NEXT_PRIVATE_STANDALONE": "1",
         "NODE_ENV": "production",
+        # aspect_rules_js js_binary actions abort at startup unless
+        # BAZEL_BINDIR is set. `js_run_binary` would set this via the
+        # `$(BINDIR)` make-var, but we invoke `next_bin` as a tool of
+        # a custom rule's ctx.actions.run, not via js_run_binary, so we
+        # pin it to "." (action working dir is the execroot, which is
+        # the project root the bin should chdir to anyway).
+        "BAZEL_BINDIR": ".",
     }
 
     args = ctx.actions.args()
     args.add("build")
     args.add(ctx.attr.app_dir or ctx.label.package)
 
+    # `deps` carries the workspace ts_project libs + npm link targets
+    # the next build action needs to resolve. Their runfiles must land
+    # in the action's input set so node's module resolution finds them
+    # under the runfiles tree.
+    deps_inputs = depset(transitive = [
+        d[DefaultInfo].default_runfiles.files
+        for d in ctx.attr.deps
+    ])
+
     ctx.actions.run(
         outputs = [out_dir],
-        inputs = depset(direct = ctx.files.srcs + ctx.files.data),
-        executable = next_bin.files_to_run.executable,
+        inputs = depset(
+            direct = ctx.files.srcs + ctx.files.data,
+            transitive = [deps_inputs],
+        ),
+        # Passing the FilesToRunProvider (not just `.executable`) auto-
+        # includes next_bin's runfiles in the action sandbox — required
+        # for `next` to load its own dependencies (webpack, swc, …).
+        executable = ctx.attr.next_bin[DefaultInfo].files_to_run,
         arguments = [args],
         env = env,
         mnemonic = "NextBuild",
@@ -79,8 +99,11 @@ next_build = rule(
             executable = True,
             cfg = "exec",
             mandatory = True,
-            doc = "`js_binary`-compatible target for the Next CLI " +
-                  "(typically `:node_modules/next/dir`).",
+            doc = "`js_binary`-compatible target for the Next CLI. " +
+                  "Generate one via `bin.next_binary(name = \"next_cli\")` " +
+                  "loaded from `@npm//<app-pkg>:next/package_json.bzl` " +
+                  "(aspect_rules_js auto-emits a binary generator for any " +
+                  "npm package with a `bin` field), then pass `:next_cli`.",
         ),
     },
     doc = "Run `next build` hermetically and emit the `.next` tree as a Bazel-output directory.",

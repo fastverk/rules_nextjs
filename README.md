@@ -27,7 +27,14 @@ You'll also need `aspect_rules_js` (or equivalent) to expose `next` as a `js_bin
 ## Quick start
 
 ```python
+load("@npm//:my-app/next/package_json.bzl", next_bin_gen = "bin")
 load("@rules_nextjs//next:defs.bzl", "next_build")
+
+# Real js_binary wrapping node_modules/next/dist/bin/next. The rule needs
+# an executable target — `:node_modules/next/dir` is a directory and
+# cannot be exec'd directly. aspect_rules_js generates `bin.next_binary`
+# for any npm package that declares a bin in its package.json.
+next_bin_gen.next_binary(name = "next_cli")
 
 next_build(
     name = "build",
@@ -45,7 +52,7 @@ next_build(
         # Runtime assets dropped into public/ before the build.
         "//db/migrations:bundle",
     ],
-    next_bin = ":node_modules/next/dir",
+    next_bin = ":next_cli",
 )
 ```
 
