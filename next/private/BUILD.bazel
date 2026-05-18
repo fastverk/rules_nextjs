@@ -1,1 +1,6 @@
 package(default_visibility = ["//next:__pkg__"])
+
+exports_files([
+    "rewrite_tsconfig.mjs",
+    "write_next_config_wrapper.mjs",
+])

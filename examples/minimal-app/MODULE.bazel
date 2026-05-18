@@ -1,0 +1,38 @@
+"""Minimal Next.js app — regression test workspace for rules_nextjs's
+next_build action under aspect_rules_js's npm-link layer.
+
+Run from this directory:
+    bazel build //:build
+
+Iterating on rules_nextjs requires `bazel mod tidy` and a `--repo_env=DO_NOT_CACHE=$(date +%s)` if you've changed `next/defs.bzl`.
+"""
+
+module(
+    name = "minimal_app",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "rules_nextjs", version = "0.1.1")
+local_path_override(
+    module_name = "rules_nextjs",
+    path = "../..",
+)
+
+bazel_dep(name = "aspect_rules_js", version = "2.3.8")
+bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_nodejs", version = "6.7.4")
+
+node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
+node.toolchain(node_version = "22.13.1")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    pnpm_lock = "//:pnpm-lock.yaml",
+    verify_node_modules_ignored = "//:.bazelignore",
+)
+use_repo(npm, "npm")
+
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+use_repo(pnpm, "pnpm")
