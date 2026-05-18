@@ -300,3 +300,95 @@ next_build = rule(
     toolchains = [_COPY_TO_DIRECTORY_TOOLCHAIN],
     doc = "Run `next build` hermetically and emit the `.next` tree as a Bazel-output directory.",
 )
+
+def _next_dev_impl(ctx):
+    app_dir = ctx.attr.app_dir or ctx.label.package
+    app_dir_arg = app_dir if app_dir else "."
+
+    launcher = ctx.actions.declare_file(ctx.label.name + ".sh")
+    ctx.actions.write(
+        output = launcher,
+        is_executable = True,
+        content = """#!/usr/bin/env bash
+# `bazel run`-launched Next.js dev server.
+#
+# Unlike `next_build`, dev mode runs *in the workspace tree* (via
+# `BUILD_WORKSPACE_DIRECTORY`, the env var bazel run sets to the
+# user's working directory) rather than a sandbox. Next.js dev needs:
+#   * Real, writable source files (so its TypeScript bootstrap can
+#     mutate tsconfig.json and the user's edits trigger fast refresh).
+#   * fs.watch on the source tree — sandbox copies wouldn't see edits.
+#   * The pnpm-managed node_modules already laid out by `pnpm install`
+#     (dev mode bundles workspace packages from source `.tsx`, not
+#     from aspect_rules_js's compiled `.jsx` content store).
+#
+# So this binary just locates the hermetic Node from `next_bin`'s
+# runfiles and execs `node <app>/node_modules/next/dist/bin/next dev`
+# from the workspace's app dir. The Bazel layer's value-add is the
+# pinned Node version + a single `bazel run` entry point alongside
+# the rest of the build graph.
+set -euo pipefail
+
+if [ -z "${{BUILD_WORKSPACE_DIRECTORY:-}}" ]; then
+    echo "next_dev: must be invoked via 'bazel run' (BUILD_WORKSPACE_DIRECTORY unset)" >&2
+    exit 1
+fi
+
+APP_DIR="{app_dir}"
+cd "${{BUILD_WORKSPACE_DIRECTORY}}/${{APP_DIR}}"
+
+# Reuse the hermetic Node `next_bin` brought in via its js_binary
+# runfiles so dev mode runs against the same Node version `next_build`
+# does. `next_bin`'s deps are merged into our runfiles tree at the
+# top level (sibling of `_main`), so we walk RUNFILES_DIR directly
+# rather than chasing a nested `.runfiles`.
+RUNFILES="${{RUNFILES_DIR:-$0.runfiles}}"
+NODE_BIN=""
+for candidate in "$RUNFILES"/rules_nodejs+*/bin/nodejs/bin/node; do
+    [ -x "$candidate" ] && NODE_BIN="$candidate" && break
+done
+if [ -z "$NODE_BIN" ]; then
+    echo "next_dev: could not locate hermetic node binary; falling back to PATH" >&2
+    NODE_BIN="$(command -v node)"
+fi
+
+# Workspace's next CLI (pnpm-installed). NOT the bazel-out one — dev
+# mode resolves the rest of node_modules relative to the next binary's
+# location, so we want the workspace layout.
+exec "$NODE_BIN" "node_modules/next/dist/bin/next" dev "$@"
+""".format(app_dir = app_dir_arg),
+    )
+
+    runfiles = ctx.runfiles(files = [launcher]).merge(
+        ctx.attr.next_bin[DefaultInfo].default_runfiles,
+    )
+
+    return [
+        DefaultInfo(
+            executable = launcher,
+            runfiles = runfiles,
+        ),
+    ]
+
+next_dev = rule(
+    implementation = _next_dev_impl,
+    attrs = {
+        "app_dir": attr.string(
+            doc = "Package-relative app root. Defaults to the package " +
+                  "containing the rule.",
+        ),
+        "next_bin": attr.label(
+            executable = True,
+            cfg = "target",
+            mandatory = True,
+            doc = "`js_binary` target for the Next CLI — used only to " +
+                  "borrow its runfiles' hermetic Node toolchain. The " +
+                  "Next CLI itself is loaded from the workspace's " +
+                  "pnpm-managed `node_modules/next` so dev-mode module " +
+                  "resolution matches `pnpm dev`.",
+        ),
+    },
+    executable = True,
+    doc = "`bazel run`-launched Next.js dev server. Runs `next dev` " +
+          "in the workspace tree against pnpm-managed node_modules.",
+)
