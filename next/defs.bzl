@@ -107,6 +107,7 @@ def _next_build_impl(ctx):
     args.add(staged_dir.path)
     args.add(ctx.file._rewrite_tsconfig.path)
     args.add(ctx.file._write_next_config_wrapper.path)
+    args.add(ctx.attr.bundler)
 
     deps_inputs = depset(transitive = [
         d[DefaultInfo].default_runfiles.files
@@ -138,6 +139,7 @@ OUT_DIR="$(pwd)/$3"
 STAGED_DIR="$(pwd)/$4"
 REWRITE_TSCONFIG="$(pwd)/$5"
 WRITE_NEXT_CONFIG_WRAPPER="$(pwd)/$6"
+BUNDLER="$7"
 EXEC_ROOT="$(pwd)"
 export BAZEL_BINDIR="${EXEC_ROOT}/${BAZEL_BINDIR}"
 
@@ -153,7 +155,31 @@ mkdir -p "$APP_RUN_DIR"
 # read-only — `find … chmod u+wx` lets us add new entries (node_modules
 # link, next.config wrapper) under the staged subdirs. Individual file
 # rewrites below `rm` + recreate, which works regardless of file mode.
-cp -R "$STAGED_DIR"/. "$APP_RUN_DIR/"
+#
+# Webpack mode keeps src files as symlinks (`cp -R`): webpack's own
+# `resolve.symlinks: true` realpath's them and walks parents from the
+# realpath'd location. With our wrapper's extensionAlias + resolve.modules
+# tweaks, that resolution finds aspect_rules_js's content store cleanly.
+# Turbopack mode needs *real* files (`cp -RL`) because Node ESM's
+# `import.meta.url` realpaths next.config.mjs and would otherwise place
+# `outputFileTracingRoot` at `bazel-bin/studio-web` (the staged dir's
+# canonical home) instead of inside the sandbox — Turbopack then
+# computes a project_path with leading `..`s and fails distDirRoot
+# validation. With real files, `import.meta.url` stays sandbox-internal.
+#
+# Webpack-mode also chokes on `cp -RL` because Next's `output: 'standalone'`
+# tracer tries to copyfile some compiled `next/dist/...` files INTO the
+# bazel-out content store paths in the sandbox; those are read-only and
+# EACCES out. With symlinks (`cp -R`) Next traces them as part of the
+# symlink-followed input set and the copy step doesn't trip.
+case "$BUNDLER" in
+    webpack)
+        cp -R "$STAGED_DIR"/. "$APP_RUN_DIR/"
+        ;;
+    turbopack)
+        cp -RL "$STAGED_DIR"/. "$APP_RUN_DIR/"
+        ;;
+esac
 find "$APP_RUN_DIR" -type d -exec chmod u+wx {} +
 
 if [ "$APP_DIR" = "." ]; then
@@ -213,25 +239,39 @@ if [ -n "$TSCONFIG_SRC" ]; then
     "$NODE_BIN" "$REWRITE_TSCONFIG" "$TSCONFIG_SRC" "${APP_RUN_DIR}/${TSCONFIG_NAME}"
 fi
 
-# Inject a webpack `resolve.extensionAlias` so `.js` imports inside the
-# compiled npm_packages fall through to `.jsx`/`.ts`/`.tsx`. The
-# workspace's shared tsconfig sets `"jsx": "preserve"` so ts_project
-# emits `.jsx` (not `.js`) for `.tsx` sources, but the surrounding
-# compiled `.ts` modules still import siblings with `.js` (tsc doesn't
-# rewrite specifiers). Wrap the user's next.config to register the
-# alias without disturbing other settings. See private/write_next_config_wrapper.mjs.
-for candidate in next.config.mjs next.config.js next.config.ts; do
-    [ -f "${APP_RUN_DIR}/${candidate}" ] || continue
-    mv "${APP_RUN_DIR}/${candidate}" "${APP_RUN_DIR}/_user.${candidate}"
-    "$NODE_BIN" "$WRITE_NEXT_CONFIG_WRAPPER" \\
-        "${APP_RUN_DIR}/_user.${candidate}" "${APP_RUN_DIR}/${candidate}"
-    break
-done
+# Bundler-conditional setup.
+#
+# `webpack` mode wraps the user's next.config to inject extension/peer-dep
+# fixes that the aspect_rules_js content-store layout requires. `turbopack`
+# mode skips the wrapper entirely — Turbopack has no equivalent of
+# webpack.resolve.extensionAlias, so the workspace must already produce
+# compiled `.js` outputs (no `jsx: preserve` ts_project shape) for
+# Turbopack to bundle through the content store cleanly. Pick `turbopack`
+# only against a workspace + an @next/swc binary that meets both
+# preconditions: see write_next_config_wrapper.mjs and the fastverk/next.js
+# `LinkType::OUTSIDE_ROOT` fork.
+case "$BUNDLER" in
+    webpack)
+        for candidate in next.config.mjs next.config.js next.config.ts; do
+            [ -f "${APP_RUN_DIR}/${candidate}" ] || continue
+            mv "${APP_RUN_DIR}/${candidate}" "${APP_RUN_DIR}/_user.${candidate}"
+            "$NODE_BIN" "$WRITE_NEXT_CONFIG_WRAPPER" \\
+                "${APP_RUN_DIR}/_user.${candidate}" "${APP_RUN_DIR}/${candidate}"
+            break
+        done
+        BUNDLER_FLAG=--webpack
+        ;;
+    turbopack)
+        BUNDLER_FLAG=--turbopack
+        ;;
+    *)
+        echo "next_build: invalid bundler='$BUNDLER' (must be 'webpack' or 'turbopack')" >&2
+        exit 1
+        ;;
+esac
 
-# `--webpack` forces the webpack pipeline. See the module docstring
-# for why Turbopack doesn't work with aspect_rules_js's npm-link
-# topology today.
-"$NODE_BIN" "${APP_RUN_DIR}/node_modules/next/dist/bin/next" build --webpack "$APP_RUN_DIR"
+cd "$APP_RUN_DIR"
+"$NODE_BIN" "${APP_RUN_DIR}/node_modules/next/dist/bin/next" build "$BUNDLER_FLAG" .
 
 # Next writes to `<app_dir>/.next/`; promote to declared output.
 # `-L` dereferences symlinks so Bazel's output-tree validator doesn't
@@ -271,6 +311,19 @@ next_build = rule(
         "app_dir": attr.string(
             doc = "Package-relative app root. Defaults to the package " +
                   "containing the rule.",
+        ),
+        "bundler": attr.string(
+            default = "webpack",
+            values = ["webpack", "turbopack"],
+            doc = "Which Next.js bundler to run. Default `webpack` (the " +
+                  "Next 16 default is Turbopack, but most workspaces hit " +
+                  "issues with Turbopack against aspect_rules_js's " +
+                  "content-store symlink topology + `jsx: preserve` " +
+                  "compiled output). Set to `turbopack` if (a) your " +
+                  "`@next/swc-<triple>` includes the fastverk fork's " +
+                  "`LinkType::OUTSIDE_ROOT` fix and (b) your ts_project " +
+                  "rules emit `.js` not `.jsx` (i.e. JSX is compiled, " +
+                  "not preserved).",
         ),
         "next_bin": attr.label(
             executable = True,
